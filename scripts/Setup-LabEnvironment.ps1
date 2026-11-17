@@ -4,11 +4,11 @@
     Guided end-to-end setup of the MSFTLabs Immersion Day environment.
 
 .DESCRIPTION
-    Stage ServicePrincipal: signs in with YOUR Azure CLI identity, creates (or reuses) the lab service principal and grants its Azure, Entra (Graph) and resource-provider prerequisites.
-    Stage Phase1: runs OpenTofu init/plan, walks you through terraform.tfvars when it is not filled out, then applies the core infrastructure with lab users and hosts deferred.
+    Stage ServicePrincipal: uses the existing ARM_* service principal supplied through Codespaces secrets or the process environment. Outside Codespaces, if no client credentials are supplied, signs in with YOUR Azure CLI identity, creates (or reuses) the lab service principal and grants its Azure, Entra (Graph) and resource-provider prerequisites.
+    Stage Phase1: runs OpenTofu init/plan, walks you through terraform.tfvars when it is not filled out, prompts for the host administrator password if the full plan includes hosts, then applies the core infrastructure with lab users and hosts deferred.
     Stage Runner: waits for the in-VNet self-hosted GitHub runner VM to finish installing its tools, registers it with the repository and sets the repository variables used by the build-image workflow.
     Stage Image: validates the Packer template, then builds the image ON the runner (private networking, no public IP) and publishes a version to the Azure Compute Gallery.
-    Stage Phase2: sizes the AVD hosts from the lab-user count, then applies users, TAPs and hosts.
+    Stage Phase2: sizes the AVD hosts from the lab-user count, prompts for the host administrator password (reusing it from Phase1 in the same run), then applies users, TAPs and hosts.
     OpenTofu and Packer stay the source of truth; this script only prepares identities and calls them. OpenTofu and Packer run as the service principal in a temporary, isolated Azure CLI profile, so your own Azure CLI login is not changed.
 
 .PARAMETER Stage
@@ -21,6 +21,7 @@
     By default a failed Packer image build KEEPS its temporary VM and resource group so you can troubleshoot it (the VM keeps running and incurs charges until you delete the group; the script logs the exact commands). Use this switch to have a failed build delete its temporary resources instead.
 
 .NOTES
+    An existing ARM_* service principal must already have the required Azure and Microsoft Graph permissions with admin consent, and registered resource providers. Its credentials and permissions are not changed.
     Everything the script and the tools it calls print is also written live to .logs/setup.log at the repository root. Each line is a UTC timestamp, a tab, then the entry (tool output is tagged [tofu], [packer] or [az]). The log is appended across runs. Secrets are not logged.
 
 .EXAMPLE
@@ -66,6 +67,7 @@ foreach ($name in 'ARM_CLIENT_ID', 'ARM_CLIENT_SECRET', 'ARM_TENANT_ID', 'ARM_SU
 $script:Tenant = $null
 $script:Subscription = $null
 $script:PublishedImageVersion = $ImageVersion
+$script:HostAdminPassword = $null
 $script:GraphAppId = '00000003-0000-0000-c000-000000000000'
 $script:GraphRoles = [ordered]@{
     'User.ReadWrite.All'                     = '741f803b-c850-494e-b5df-cde7c675a1ca'
@@ -205,6 +207,7 @@ function Invoke-Stage {
         } catch {
             Write-Log "ERROR during ${Name}: $($_.Exception.Message)"
             Write-Log "$($_.ScriptStackTrace)" -Quiet
+            if ($env:GITHUB_ACTIONS -eq 'true') { throw }
             $choice = Read-HostLogged 'Fix the cause, then [R]etry this step or [A]bort (default: Abort)'
             if ($choice -notmatch '^(?i)r') { throw }
         }
@@ -336,7 +339,7 @@ function Test-ServicePrincipalSecret {
     $previous = $env:AZURE_CONFIG_DIR
     try {
         $env:AZURE_CONFIG_DIR = $probe
-        & az login --service-principal --username $AppId --password $Secret --tenant $script:Tenant --only-show-errors --output none 2>$null
+        & az login --service-principal --username $AppId "--password=$Secret" --tenant $script:Tenant --only-show-errors --output none 2>$null
         return ($LASTEXITCODE -eq 0)
     } finally {
         $env:AZURE_CONFIG_DIR = $previous
@@ -427,14 +430,14 @@ function Connect-ServicePrincipalSession {
     foreach ($name in 'ARM_CLIENT_ID', 'ARM_CLIENT_SECRET', 'ARM_TENANT_ID', 'ARM_SUBSCRIPTION_ID') {
         if (-not [Environment]::GetEnvironmentVariable($name, 'Process')) {
             $userValue = [Environment]::GetEnvironmentVariable($name, 'User')
-            if (-not $userValue) { throw "$name is not set. Run the ServicePrincipal stage first (-Stage ServicePrincipal)." }
+            if (-not $userValue) { throw "$name is not set. Supply all four ARM_* variables through Codespaces secrets or your environment. To create a service principal instead, run -Stage ServicePrincipal outside Codespaces without existing client credentials." }
             [Environment]::SetEnvironmentVariable($name, $userValue, 'Process')
         }
     }
     if ($script:IsolatedConfig -and (Test-Path -LiteralPath $script:IsolatedConfig)) { Remove-Item -LiteralPath $script:IsolatedConfig -Recurse -Force -ErrorAction SilentlyContinue }
     $script:IsolatedConfig = Join-Path ([IO.Path]::GetTempPath()) ('azcfg-lab-' + [guid]::NewGuid().ToString('N'))
     $env:AZURE_CONFIG_DIR = $script:IsolatedConfig
-    & az login --service-principal --username $env:ARM_CLIENT_ID --password $env:ARM_CLIENT_SECRET --tenant $env:ARM_TENANT_ID --only-show-errors --output none
+    & az login --service-principal --username $env:ARM_CLIENT_ID "--password=$env:ARM_CLIENT_SECRET" --tenant $env:ARM_TENANT_ID --only-show-errors --output none
     if ($LASTEXITCODE -ne 0) { throw 'Service principal sign-in failed. A brand-new secret can take a short time to become usable.' }
     Invoke-Az @('account', 'set', '--subscription', $env:ARM_SUBSCRIPTION_ID) | Out-Null
 }
@@ -465,6 +468,11 @@ function Wait-ForGraphRole {
 }
 
 function Step-ServicePrincipal {
+    if ($env:CODESPACES -eq 'true' -or ($env:ARM_CLIENT_ID -and $env:ARM_CLIENT_SECRET)) {
+        Write-Log 'Using the existing service principal from ARM_* environment variables; no app registration, client secret or permission changes will be made.'
+        Connect-ServicePrincipalSession
+        return
+    }
     Connect-UserIdentity
     Test-UserPermissions
     $details = Get-ServicePrincipalDetails
@@ -517,7 +525,12 @@ function Step-Phase1 {
         if (-not (Confirm-Action 'Use these values?')) { Update-TfVarsInteractive }
     }
     Write-Log 'Planning the full configuration (labbuild.plan) to validate it before anything is applied.'
-    Invoke-OpenTofu @('plan', '-input=false', '-out=labbuild.plan')
+    try {
+        if ([int](Get-TfVar 'avd_session_host_count') -gt 0) { Set-HostAdminPasswordVars }
+        Invoke-OpenTofu @('plan', '-input=false', '-out=labbuild.plan')
+    } finally {
+        Remove-Item -LiteralPath $script:SecretVarsPath -Force -ErrorAction SilentlyContinue
+    }
 
     $state = @(& $OpenTofuCommand "-chdir=$script:InfraDirectory" state list -no-color 2>$null)
     $hasUsersOrHosts = @($state | Where-Object { $_ -match '^azuread_user\.lab|^azurerm_windows_virtual_machine\.' }).Count -gt 0
@@ -563,6 +576,7 @@ function Invoke-RunnerShell {
 function Get-GitHubRunnerState {
     param($Runner)
     $text = (& gh api "repos/$($Runner.github_repository)/actions/runners" --jq ".runners[] | select(.name==`"$($Runner.name)`") | .status" 2>$null | Out-String).Trim()
+    if ($LASTEXITCODE -ne 0) { throw "Could not read the GitHub runners for $($Runner.github_repository). Check GH_TOKEN and its repository runner permissions." }
     return $text
 }
 
@@ -586,7 +600,7 @@ function Step-Runner {
     } else {
         Write-Log "Registering the runner with $($runner.github_repository)."
         $token = (& gh api -X POST "repos/$($runner.github_repository)/actions/runners/registration-token" --jq .token | Out-String).Trim()
-        if (-not $token) { throw 'Could not create a runner registration token. gh needs admin rights on the repository.' }
+        if ($LASTEXITCODE -ne 0 -or -not $token) { throw 'Could not create a runner registration token. gh needs admin rights on the repository.' }
         $labels = ($runner.labels | Where-Object { $_ -notin @('self-hosted', 'linux') }) -join ','
         $registerScript = @"
 set -e
@@ -614,7 +628,7 @@ sudo -u $($runner.admin_username) ./config.sh --unattended --replace --url 'http
         GALLERY_RESOURCE_GROUP = $configuration.gallery_resource_group
         GALLERY_NAME           = $configuration.gallery_name
         IMAGE_DEFINITION_NAME  = $configuration.image_definition_name
-        REPLICATION_REGIONS    = ($configuration.replication_regions | ConvertTo-Json -Compress)
+        REPLICATION_REGIONS    = (ConvertTo-Json -InputObject @($configuration.replication_regions) -Compress)
         VNET_NAME              = $configuration.virtual_network_name
         VNET_RESOURCE_GROUP    = $configuration.virtual_network_resource_group_name
         VNET_SUBNET_NAME       = $configuration.virtual_network_subnet_name
@@ -711,7 +725,7 @@ function Invoke-ImageBuild {
     $onError = if ($CleanupOnFailure) { 'cleanup' } else { 'abort' }
     Write-Log "Dispatching the build-image workflow on $repository ($branch @ $($sha.Substring(0, 7))) for $sku, gallery version $Version. The self-hosted runner $($runner.name) checks out the repository and runs Packer."
     $dispatchedAt = [DateTime]::UtcNow.AddMinutes(-1)
-    $code = Invoke-Native -Source 'gh' -FilePath 'gh' -Arguments @('workflow', 'run', 'build-image.yml', '--repo', $repository, '--ref', $branch, '-f', "image_version=$Version", '-f', "image_sku=$sku", '-f', "on_error=$onError")
+    $code = Invoke-Native -Source 'gh' -FilePath 'gh' -Arguments @('workflow', 'run', 'build-image.yml', '--repo', $repository, '--ref', $branch, '-f', "image_version=$Version", '-f', "image_sku=$sku", '-f', "vm_size=$VmSize", '-f', "source_image_version=$($sourceImage.name)", '-f', "on_error=$onError")
     if ($code -ne 0) { throw "Could not dispatch the build-image workflow (exit code $code). The workflow file must exist on GitHub for branch '$branch'." }
 
     $runId = $null
@@ -792,12 +806,18 @@ function Test-HostCapacity {
 function Read-HostAdminPassword {
     Write-Log 'Local administrator password for the session hosts (12-123 characters). Press Enter to generate one and store it in the lab Key Vault.'
     $first = Read-Host 'Password' -AsSecureString
+    if ($first.Length -eq 0) { return @{ Value = New-RandomPassword; Generated = $true } }
     $plain = ConvertFrom-SecureString $first -AsPlainText
-    if ([string]::IsNullOrEmpty($plain)) { return @{ Value = New-RandomPassword; Generated = $true } }
     $second = Read-Host 'Confirm password' -AsSecureString
-    if ($plain -cne (ConvertFrom-SecureString $second -AsPlainText)) { throw 'The passwords did not match.' }
+    if ($second.Length -eq 0 -or $plain -cne (ConvertFrom-SecureString $second -AsPlainText)) { throw 'The passwords did not match.' }
     if ($plain.Length -lt 12 -or $plain.Length -gt 123) { throw 'The password must be 12-123 characters.' }
     return @{ Value = $plain; Generated = $false }
+}
+
+function Set-HostAdminPasswordVars {
+    if (-not $script:HostAdminPassword) { $script:HostAdminPassword = Read-HostAdminPassword }
+    @{ avd_admin_password = $script:HostAdminPassword.Value } | ConvertTo-Json -Compress | Set-Content -LiteralPath $script:SecretVarsPath -Encoding utf8NoBOM
+    Protect-SecretFile -Path $script:SecretVarsPath
 }
 
 function Save-GeneratedPassword {
@@ -828,16 +848,13 @@ function Step-Phase2 {
     if (-not (Confirm-Action 'Deploy lab users, TAPs and these hosts?')) { throw 'Phase 2 was declined.' }
     Test-HostCapacity -HostCount $maxHosts
 
-    $password = Read-HostAdminPassword
-    if ($password.Generated) { Save-GeneratedPassword -Value $password.Value }
-    Set-TfVar 'avd_session_host_count' $maxHosts
-    Set-TfVar 'avd_image_version' $script:PublishedImageVersion
-    Set-TfVar 'avd_registration_expiration' ([DateTime]::UtcNow.AddDays(7).ToString("yyyy-MM-dd'T'HH:mm:ss'Z'"))
-    Write-Log 'terraform.tfvars now records the host count, image version and a 7-day registration expiry (renew the expiry before later plans that keep hosts).'
     try {
-        @{ avd_admin_password = $password.Value } | ConvertTo-Json -Compress | Set-Content -LiteralPath $script:SecretVarsPath -Encoding utf8NoBOM
-        Protect-SecretFile -Path $script:SecretVarsPath
-        $password = $null
+        Set-HostAdminPasswordVars
+        if ($script:HostAdminPassword.Generated) { Save-GeneratedPassword -Value $script:HostAdminPassword.Value }
+        Set-TfVar 'avd_session_host_count' $maxHosts
+        Set-TfVar 'avd_image_version' $script:PublishedImageVersion
+        Set-TfVar 'avd_registration_expiration' ([DateTime]::UtcNow.AddDays(7).ToString("yyyy-MM-dd'T'HH:mm:ss'Z'"))
+        Write-Log 'terraform.tfvars now records the host count, image version and a 7-day registration expiry (renew the expiry before later plans that keep hosts).'
         Invoke-OpenTofu @('plan', '-input=false', '-out=labphase2.plan')
         if (-not (Confirm-Action 'Apply the Phase 2 plan above? This creates the Entra users, issues TAPs, writes credentials to Key Vault and deploys the hosts.')) { throw 'Phase 2 apply was declined.' }
         Invoke-OpenTofu @('apply', '-input=false', 'labphase2.plan')
@@ -943,6 +960,7 @@ try {
     Write-Log "=== run end: exit code $exitCode ===" -Quiet
     Remove-PlanFile
     Remove-Item -LiteralPath $script:SecretVarsPath -Force -ErrorAction SilentlyContinue
+    $script:HostAdminPassword = $null
     $env:AZURE_CONFIG_DIR = $script:OriginalConfigDir
     if (-not $script:OriginalConfigDir) { Remove-Item Env:AZURE_CONFIG_DIR -ErrorAction SilentlyContinue }
     if ($script:IsolatedConfig -and (Test-Path -LiteralPath $script:IsolatedConfig)) { Remove-Item -LiteralPath $script:IsolatedConfig -Recurse -Force -ErrorAction SilentlyContinue }

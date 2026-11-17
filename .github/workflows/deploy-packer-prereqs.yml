@@ -1,0 +1,99 @@
+name: Deploy Packer prerequisites
+
+# Fresh, disposable environments only. OpenTofu state exists only during this job.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-packer-prereqs
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      ARM_CLIENT_ID: ${{ secrets.ARM_CLIENT_ID }}
+      ARM_CLIENT_SECRET: ${{ secrets.ARM_CLIENT_SECRET }}
+      ARM_TENANT_ID: ${{ secrets.ARM_TENANT_ID }}
+      ARM_SUBSCRIPTION_ID: ${{ secrets.ARM_SUBSCRIPTION_ID }}
+      GH_TOKEN: ${{ secrets.GH_TOKEN }}
+      TF_IN_AUTOMATION: 'true'
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Check required secrets
+        shell: pwsh
+        run: |
+          foreach ($name in 'ARM_CLIENT_ID', 'ARM_CLIENT_SECRET', 'ARM_TENANT_ID', 'ARM_SUBSCRIPTION_ID', 'GH_TOKEN') {
+            if ([string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($name))) {
+              throw "Required Actions secret '$name' is not set."
+            }
+          }
+
+      - uses: opentofu/setup-opentofu@v1
+        with:
+          tofu_version: 1.13.1
+          tofu_wrapper: false
+
+      - uses: hashicorp/setup-packer@v3
+        with:
+          version: 1.16.1
+
+      - name: Sign in with the pre-staged service principal
+        run: |
+          az login --service-principal \
+            --username "$ARM_CLIENT_ID" \
+            --password="$ARM_CLIENT_SECRET" \
+            --tenant "$ARM_TENANT_ID" --output none
+          az account set --subscription "$ARM_SUBSCRIPTION_ID"
+
+      - name: Check GitHub access
+        run: |
+          gh api "repos/$GITHUB_REPOSITORY/actions/runners" --silent
+          gh variable list --repo "$GITHUB_REPOSITORY" --json name > /dev/null
+
+      - name: Register Azure resource providers
+        run: |
+          for namespace in \
+            Microsoft.Compute Microsoft.Network Microsoft.KeyVault \
+            Microsoft.DesktopVirtualization Microsoft.Storage \
+            Microsoft.OperationalInsights Microsoft.Insights; do
+            az provider register --namespace "$namespace" --wait
+          done
+
+      - name: Initialize and validate OpenTofu
+        run: |
+          tofu -chdir=infra init -input=false
+          tofu -chdir=infra validate -no-color
+
+      - name: Plan foundation without lab users or session hosts
+        run: |
+          tofu -chdir=infra plan -input=false -no-color \
+            -var="subscription_id=$ARM_SUBSCRIPTION_ID" \
+            -var="tenant_id=$ARM_TENANT_ID" \
+            -var="runner_github_repository=$GITHUB_REPOSITORY" \
+            -var='num_of_labusers=0' \
+            -var='avd_session_host_count=0' \
+            -out=labphase1.plan
+
+      - name: Apply foundation
+        run: tofu -chdir=infra apply -input=false -no-color labphase1.plan
+
+      - name: Bootstrap runner and publish image-build configuration
+        run: pwsh -NoLogo -NoProfile -NonInteractive -File ./scripts/Setup-LabEnvironment.ps1 -Stage Runner
+
+      - name: Summarize deployment
+        run: |
+          {
+            echo '## Packer prerequisites deployed'
+            echo
+            echo 'The private self-hosted runner is online and the image-build repository variables are configured.'
+            echo 'Run **Build lab image** to build using the pre-staged service principal.'
+            echo
+            echo '**Disposable deployment:** OpenTofu state is not retained after this job.'
+            echo 'Clean up the Azure resources and GitHub runner before starting another fresh deployment.'
+          } >> "$GITHUB_STEP_SUMMARY"

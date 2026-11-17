@@ -4,6 +4,23 @@ Deploy from GitHub Codespaces or a local VS Code Dev Container using Bash or Pow
 
 Open Lab Desktops: [client.wvd.microsoft.com/arm/webclient/index.html](https://client.wvd.microsoft.com/arm/webclient/index.html.)
 
+## GitHub Actions: Private Packer Build
+
+For a **new, disposable deployment**, run [Deploy Packer prerequisites](.github/workflows/deploy-packer-prereqs.yml) manually from the repository's Actions tab. It uses a GitHub-hosted runner to deploy the OpenTofu foundation, provision and register the private self-hosted runner, and set the repository variables consumed by [Build lab image](.github/workflows/build-image.yml).
+
+Configure these **Actions repository secrets** first (Codespaces secrets are separate):
+
+- `ARM_CLIENT_ID`, `ARM_CLIENT_SECRET`, `ARM_TENANT_ID`, `ARM_SUBSCRIPTION_ID`: the existing pre-staged service principal. Both workflows use it; neither creates a service principal or requires OIDC.
+- `GH_TOKEN`: a GitHub token authorized to administer this repository's self-hosted runners and read/write repository Actions variables.
+
+Review the region, resource names and networking in [infra/terraform.tfvars](infra/terraform.tfvars). The prerequisite workflow overrides the tenant/subscription with the SPN secrets, registers the runner against the workflow's repository, and sets lab-user/session-host counts to zero. It also deploys the current foundation's Key Vault, monitoring, Bastion and AVD control plane, but no lab users, TAPs or Windows session hosts.
+
+Once it succeeds, run **Build lab image**. Packer executes on the in-VNet self-hosted runner and connects to the Windows build VM privately; the build does not use a public-IP VM.
+
+The image workflow accepts the build VM size and Marketplace source image version. The setup script passes its validated VM size and resolved source version when dispatching a build. Only an existing gallery version in `Succeeded` state is skipped; lookup errors and incomplete/failed versions stop the workflow.
+
+**State is intentionally not retained:** the prerequisite workflow keeps OpenTofu state only within its job. Do not use it to update an existing environment or rerun it against resources left by an earlier deployment. Clean up Azure resources and the registered GitHub runner separately before another fresh deployment. Without retained state, later OpenTofu updates/destroy require recovering or importing state first.
+
 ## Local Environment
 
 1. In GitHub, select **Code > Codespaces > Create codespace**, or open the cloned repository in VS Code and select **Dev Containers: Reopen in Container** (requires Docker and the Dev Containers extension).

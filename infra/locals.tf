@@ -28,7 +28,7 @@ locals {
   runner_name              = "msftlabs-runner"
   runner_size              = "Standard_D2s_v5"
   runner_admin_username    = "runneradmin"
-  runner_github_repository = "MSFTLabs/msftlabs-immersion-day"
+  runner_github_repository = var.runner_github_repository
 
   // Image Settings that shouldn't be changed without review.
   image_architecture           = "x64"

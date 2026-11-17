@@ -2,7 +2,7 @@ name: Build lab image
 
 # Builds the Windows 11 multi-session image on the self-hosted runner inside the lab VNet.
 # A change to packer/CHANGELOG.md on main starts a build of the version in its first "## [x.y.z]" heading; an existing gallery version is skipped.
-# Variables are set by `./scripts/Setup-LabEnvironment.ps1 -Stage Runner`. Authentication uses the runner VM's managed identity.
+# Variables are set by deploy-packer-prereqs.yml (or the setup script's Runner stage). Authentication uses the pre-staged SPN.
 on:
   push:
     branches: [main]
@@ -19,6 +19,16 @@ on:
         description: Windows 11 multi-session marketplace SKU
         required: false
         default: win11-26h2-avd
+        type: string
+      vm_size:
+        description: Temporary Packer build VM size
+        required: false
+        default: Standard_D4s_v5
+        type: string
+      source_image_version:
+        description: Marketplace source image version
+        required: false
+        default: latest
         type: string
       on_error:
         description: Packer behavior when the build fails (abort keeps the temporary VM for troubleshooting)
@@ -40,13 +50,30 @@ jobs:
   build:
     runs-on: [self-hosted, linux, msftlabs-image]
     timeout-minutes: 150
+    env:
+      ARM_CLIENT_ID: ${{ secrets.ARM_CLIENT_ID }}
+      ARM_CLIENT_SECRET: ${{ secrets.ARM_CLIENT_SECRET }}
+      ARM_TENANT_ID: ${{ secrets.ARM_TENANT_ID }}
+      ARM_SUBSCRIPTION_ID: ${{ secrets.ARM_SUBSCRIPTION_ID }}
     steps:
       - uses: actions/checkout@v7
 
-      - name: Sign in with the runner's managed identity
+      - name: Check required secrets
+        shell: pwsh
         run: |
-          az login --identity --output none
-          az account set --subscription "${{ vars.AZURE_SUBSCRIPTION_ID }}"
+          foreach ($name in 'ARM_CLIENT_ID', 'ARM_CLIENT_SECRET', 'ARM_TENANT_ID', 'ARM_SUBSCRIPTION_ID') {
+            if ([string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($name))) {
+              throw "Required Actions secret '$name' is not set."
+            }
+          }
+
+      - name: Sign in with the pre-staged service principal
+        run: |
+          az login --service-principal \
+            --username "$ARM_CLIENT_ID" \
+            --password="$ARM_CLIENT_SECRET" \
+            --tenant "$ARM_TENANT_ID" --output none
+          az account set --subscription "$ARM_SUBSCRIPTION_ID"
 
       - name: Resolve image version
         id: image
@@ -59,13 +86,25 @@ jobs:
             echo "No version found in packer/CHANGELOG.md" >&2
             exit 1
           fi
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo 'Image version must use numeric Major.Minor.Patch format.' >&2
+            exit 1
+          fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "sku=${INPUT_SKU:-win11-26h2-avd}" >> "$GITHUB_OUTPUT"
-          if az sig image-version show --resource-group "${{ vars.GALLERY_RESOURCE_GROUP }}" --gallery-name "${{ vars.GALLERY_NAME }}" --gallery-image-definition "${{ vars.IMAGE_DEFINITION_NAME }}" --gallery-image-version "$version" --output none 2>/dev/null; then
+          state=$(az sig image-version list \
+            --resource-group "${{ vars.GALLERY_RESOURCE_GROUP }}" \
+            --gallery-name "${{ vars.GALLERY_NAME }}" \
+            --gallery-image-definition "${{ vars.IMAGE_DEFINITION_NAME }}" \
+            --query "[?name=='$version'].provisioningState | [0]" --output tsv)
+          if [ "$state" = Succeeded ]; then
             echo "exists=true" >> "$GITHUB_OUTPUT"
             echo "::notice::Image version $version already exists in the gallery; skipping the build."
-          else
+          elif [ -z "$state" ]; then
             echo "exists=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Image version $version already exists with provisioning state '$state'; it cannot be overwritten." >&2
+            exit 1
           fi
 
       - name: Write Packer variables
@@ -73,21 +112,34 @@ jobs:
         env:
           IMAGE_VERSION: ${{ steps.image.outputs.version }}
           IMAGE_SKU: ${{ steps.image.outputs.sku }}
+          VM_SIZE: ${{ inputs.vm_size || 'Standard_D4s_v5' }}
+          SOURCE_IMAGE_VERSION: ${{ inputs.source_image_version || 'latest' }}
+          AZURE_LOCATION: ${{ vars.AZURE_LOCATION }}
+          GALLERY_RESOURCE_GROUP: ${{ vars.GALLERY_RESOURCE_GROUP }}
+          GALLERY_NAME: ${{ vars.GALLERY_NAME }}
+          IMAGE_DEFINITION_NAME: ${{ vars.IMAGE_DEFINITION_NAME }}
+          VNET_NAME: ${{ vars.VNET_NAME }}
+          VNET_RESOURCE_GROUP: ${{ vars.VNET_RESOURCE_GROUP }}
+          VNET_SUBNET_NAME: ${{ vars.VNET_SUBNET_NAME }}
+          REPLICATION_REGIONS: ${{ vars.REPLICATION_REGIONS }}
+          RESOURCE_TAGS: ${{ vars.RESOURCE_TAGS }}
         run: |
           jq -n \
-            --arg subscription_id "${{ vars.AZURE_SUBSCRIPTION_ID }}" \
-            --arg tenant_id "${{ vars.AZURE_TENANT_ID }}" \
-            --arg location "${{ vars.AZURE_LOCATION }}" \
-            --arg gallery_resource_group "${{ vars.GALLERY_RESOURCE_GROUP }}" \
-            --arg gallery_name "${{ vars.GALLERY_NAME }}" \
-            --arg image_definition_name "${{ vars.IMAGE_DEFINITION_NAME }}" \
+            --arg subscription_id "$ARM_SUBSCRIPTION_ID" \
+            --arg tenant_id "$ARM_TENANT_ID" \
+            --arg location "$AZURE_LOCATION" \
+            --arg gallery_resource_group "$GALLERY_RESOURCE_GROUP" \
+            --arg gallery_name "$GALLERY_NAME" \
+            --arg image_definition_name "$IMAGE_DEFINITION_NAME" \
             --arg image_version "$IMAGE_VERSION" \
             --arg image_sku "$IMAGE_SKU" \
-            --arg virtual_network_name "${{ vars.VNET_NAME }}" \
-            --arg virtual_network_resource_group_name "${{ vars.VNET_RESOURCE_GROUP }}" \
-            --arg virtual_network_subnet_name "${{ vars.VNET_SUBNET_NAME }}" \
-            --argjson replication_regions '${{ vars.REPLICATION_REGIONS }}' \
-            --argjson tags '${{ vars.RESOURCE_TAGS }}' \
+            --arg vm_size "$VM_SIZE" \
+            --arg source_image_version "$SOURCE_IMAGE_VERSION" \
+            --arg virtual_network_name "$VNET_NAME" \
+            --arg virtual_network_resource_group_name "$VNET_RESOURCE_GROUP" \
+            --arg virtual_network_subnet_name "$VNET_SUBNET_NAME" \
+            --argjson replication_regions "$REPLICATION_REGIONS" \
+            --argjson tags "$RESOURCE_TAGS" \
             '$ARGS.named' > build.pkrvars.json
 
       - name: Packer init and validate
