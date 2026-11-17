@@ -13,7 +13,7 @@ Configure these **Actions repository secrets** first (Codespaces secrets are sep
 - `ARM_CLIENT_ID`, `ARM_CLIENT_SECRET`, `ARM_TENANT_ID`, `ARM_SUBSCRIPTION_ID`: the existing pre-staged service principal. Both workflows use it; neither creates a service principal or requires OIDC.
 - `GH_TOKEN`: a GitHub token authorized to administer this repository's self-hosted runners and read/write repository Actions variables.
 
-Review the region, resource names and networking in [infra/terraform.tfvars](infra/terraform.tfvars). The prerequisite workflow overrides the tenant/subscription with the SPN secrets, registers the runner against the workflow's repository, and sets lab-user/session-host counts to zero. It also deploys the current foundation's Key Vault, monitoring, Bastion and AVD control plane, but no lab users, TAPs or Windows session hosts.
+Review the region, resource names and networking in [infra/terraform.tfvars](infra/terraform.tfvars). The prerequisite workflow overrides the tenant/subscription with the SPN secrets, registers the runner against the workflow's repository, and sets lab-user/session-host counts to zero. Both plan and saved-plan apply pass the same overrides so OpenTofu does not reload conflicting values from `terraform.tfvars`. It also deploys the current foundation's Key Vault, monitoring, Bastion and AVD control plane, but no lab users, TAPs or Windows session hosts.
 
 Once it succeeds, run **Build lab image**. Packer executes on the in-VNet self-hosted runner and connects to the Windows build VM privately; the build does not use a public-IP VM.
 

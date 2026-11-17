@@ -81,7 +81,14 @@ jobs:
             -out=labphase1.plan
 
       - name: Apply foundation
-        run: tofu -chdir=infra apply -input=false -no-color labphase1.plan
+        run: |
+          tofu -chdir=infra apply -input=false -no-color \
+            -var="subscription_id=$ARM_SUBSCRIPTION_ID" \
+            -var="tenant_id=$ARM_TENANT_ID" \
+            -var="runner_github_repository=$GITHUB_REPOSITORY" \
+            -var='num_of_labusers=0' \
+            -var='avd_session_host_count=0' \
+            labphase1.plan
 
       - name: Bootstrap runner and publish image-build configuration
         run: pwsh -NoLogo -NoProfile -NonInteractive -File ./scripts/Setup-LabEnvironment.ps1 -Stage Runner
