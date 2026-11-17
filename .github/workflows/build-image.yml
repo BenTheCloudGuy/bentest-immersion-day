@@ -1,13 +1,9 @@
 name: Build lab image
 
 # Builds the Windows 11 multi-session image on the self-hosted runner inside the lab VNet.
-# A change to packer/CHANGELOG.md on main starts a build of the version in its first "## [x.y.z]" heading; an existing gallery version is skipped.
+# Manual only: run it from the Actions tab. An empty image_version builds the version in the first "## [x.y.z]" heading of packer/CHANGELOG.md; an existing gallery version is skipped.
 # Variables are set by deploy-packer-prereqs.yml (or the setup script's Runner stage). Authentication uses the pre-staged SPN.
 on:
-  push:
-    branches: [main]
-    paths:
-      - packer/CHANGELOG.md
   workflow_dispatch:
     inputs:
       image_version:

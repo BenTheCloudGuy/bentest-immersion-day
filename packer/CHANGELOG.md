@@ -1,6 +1,6 @@
 # Changelog
 
-A new Packer image build starts when this file changes on `main`. The build publishes the version in the first `## [x.y.z]` heading to the Azure Compute Gallery, and skips the build when that version already exists. Add a new heading at the top for every image change, and follow [Semantic Versioning](https://semver.org/).
+Image builds are started manually (the **Build lab image** workflow's *Run workflow* button). With no version entered, the build publishes the version in the first `## [x.y.z]` heading to the Azure Compute Gallery, and skips the build when that version already exists. Add a new heading at the top for every image change, and follow [Semantic Versioning](https://semver.org/).
 
 ## [1.0.3] - 2026-10-29
 
