@@ -43,6 +43,12 @@ variable "tenant_id" {
   }
 }
 
+variable "runner_github_repository" {
+  type        = string
+  description = "GitHub owner/repository where the private image-build runner is registered."
+  default     = "MSFTLabs/msftlabs-immersion-day"
+}
+
 variable "network_config" {
   type = object({
     name                    = string
