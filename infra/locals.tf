@@ -245,8 +245,8 @@ locals {
   lab_tap_target_type           = "group"
   lab_tap_registration_required = false
   lab_tap_minimum_lifetime      = 480
-  lab_tap_maximum_lifetime      = 720
-  lab_tap_lifetime_minutes      = 480
+  lab_tap_maximum_lifetime      = 4320
+  lab_tap_lifetime_minutes      = 4320
   lab_tap_length                = 8
   lab_tap_is_usable_once        = false
   lab_tap_policy_method         = "PATCH"
@@ -278,7 +278,7 @@ locals {
     }
   ])
 
-  lab_key_vault_name                       = "${lower(local.key_vault_name_prefix)}-${substr(sha256("${var.tenant_id}:${var.subscription_id}:${var.resource_group_name}"), 0, 8)}"
+  lab_key_vault_name                       = "${lower(local.key_vault_name_prefix)}-${substr(sha256("${var.tenant_id}:${var.subscription_id}:${var.resource_group_name}:v2"), 0, 8)}"
   lab_key_vault_sku                        = "standard"
   lab_key_vault_rbac_enabled               = true
   lab_key_vault_public_network_access      = true

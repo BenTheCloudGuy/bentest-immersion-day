@@ -6,7 +6,7 @@ Open Lab Desktops: [client.wvd.microsoft.com/arm/webclient/index.html](https://c
 
 ## GitHub Actions: Private Packer Build
 
-For a **new, disposable deployment**, run [Deploy Packer prerequisites](.github/workflows/deploy-packer-prereqs.yml) manually from the repository's Actions tab. It uses a GitHub-hosted runner to deploy the OpenTofu foundation, provision and register the private self-hosted runner, and set the repository variables consumed by [Build lab image](.github/workflows/build-image.yml).
+Run [Deploy Packer prerequisites](.github/workflows/deploy-packer-prereqs.yml) manually from the repository's Actions tab. It uses a GitHub-hosted runner to create persistent state storage, deploy the OpenTofu foundation, provision and register the private self-hosted runner, and set the repository variables consumed by [Build lab image](.github/workflows/build-image.yml).
 
 Configure these **Actions repository secrets** first (Codespaces secrets are separate):
 
@@ -19,7 +19,19 @@ Once it succeeds, run **Build lab image**. Packer executes on the in-VNet self-h
 
 The image workflow accepts the build VM size and Marketplace source image version. The setup script passes its validated VM size and resolved source version when dispatching a build. Only an existing gallery version in `Succeeded` state is skipped; lookup errors and incomplete/failed versions stop the workflow.
 
-**State is intentionally not retained:** the prerequisite workflow keeps OpenTofu state only within its job. Do not use it to update an existing environment or rerun it against resources left by an earlier deployment. Clean up Azure resources and the registered GitHub runner separately before another fresh deployment. Without retained state, later OpenTofu updates/destroy require recovering or importing state first.
+### Persistent state and recovery
+
+The prerequisite workflow creates a separate `<deploymentName>-state` resource group and a deterministic storage account (`stlab` plus the first 19 hex characters of SHA-256 of the lowercased `<subscriptionId>/<deploymentName>`). The container is `infra`; the blob is `prereq/<deploymentName>.tfstate`. The optional workflow input `deployment_name` defaults to `resource_group_name` in [infra/terraform.tfvars](infra/terraform.tfvars). Keep this name unchanged for the deployment.
+
+[Initialize-PrerequisiteState.ps1](.github/scripts/Initialize-PrerequisiteState.ps1) creates the storage before initializing the Azure backend. OpenTofu writes state directly to the blob throughout apply, including partial failures, and uses blob leases for locking; it does not wait until the end of the job to upload state. Storage is outside the lab configuration so destroying the lab does not destroy its state. Keep the state resource group during lab cleanup. The existing SPN needs permission to create the storage resources and list storage account keys; no additional identity or repository secrets are used.
+
+**Existing local state:** after signing in, run the initializer from the same checkout that holds `infra/terraform.tfstate`. It migrates that state to the blob. If local and remote state both exist, migration stops rather than overwriting either. Do not manually upload a stale state file over an existing blob.
+
+**Previous Actions state was lost:** changing backends cannot reconstruct it. The workflow stops before foundation apply when the lab resource group exists but the backend has no managed resources. Initialize this backend locally, inventory the actual surviving resources, and import them into their matching addresses before rerunning. Import all surviving managed resources, not just the diagnostic settings named in the error. For diagnostic settings the import ID is `<target-resource-id>|lab-to-log-analytics`; for the runner secret it is its versioned Key Vault secret URI. Use the same tenant, subscription, repository and zero-count overrides as the foundation plan for each import. Never put secret values in command lines or tracked files.
+
+Recovering the runner also requires reconciling `random_password.runner` with the password actually assigned to its VM. A recovered Key Vault secret can belong to an older VM, so do not assume it matches the current runner. Importing the VM or secret alone does not recover the random-password state. Resolve this before apply to avoid an unintended password change. Review the resulting plan for replacements or deletions before continuing.
+
+The prerequisite workflow refuses to run against state containing lab users or session hosts because its zero-count overrides would delete them. Use the setup script's Phase2 stage with the intended counts for a populated lab.
 
 ## Local Environment
 
@@ -34,7 +46,7 @@ packer version
 pwsh --version
 ```
 
-Use the same checkout and OpenTofu state throughout. For an existing deployment, restore its state securely before applying; do not start with empty state. State and saved plans contain secrets and must not be committed or lost when deleting a Codespace.
+Use the same deployment name and Azure backend for Actions and local runs. Initialize it after signing in as shown below. State and saved plans contain secrets and must not be committed.
 
 ### Set MYIP
 
@@ -82,6 +94,16 @@ az login --service-principal --username $env:ARM_CLIENT_ID --password $env:ARM_C
 az account set --subscription $env:ARM_SUBSCRIPTION_ID
 az account show --query '{subscription:id,tenant:tenantId,identity:user.name}' --output table
 ```
+
+### Initialize State Storage
+
+After signing in, run this once per checkout before the setup script or manual OpenTofu commands:
+
+```powershell
+pwsh -NoProfile -File ./.github/scripts/Initialize-PrerequisiteState.ps1
+```
+
+If Actions uses a custom `deployment_name`, pass the identical value with `-DeploymentName`. The initializer prints the state resource group, account, container and blob key. Later `tofu init` calls reuse the cached backend configuration. Do not use a different backend for local Phase2 or destroy.
 
 ## Phase 1: Deploy the Foundation with OpenTofu
 

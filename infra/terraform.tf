@@ -20,5 +20,5 @@ terraform {
     }
   }
 
-  backend "local" {}
+  backend "azurerm" {}
 }
