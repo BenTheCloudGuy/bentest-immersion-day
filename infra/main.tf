@@ -58,6 +58,28 @@ data "azurerm_monitor_diagnostic_categories" "shared" {
   resource_id = each.value.resource_id
 }
 
+// Deleting the resource group leaves the Bastion and AVD diagnostic settings behind, and they reattach to the next resources created with the same IDs,
+// so the provider fails with "already exists". The activity log shows the NSG settings are not left behind, so only these four targets are cleared.
+// The setting is deleted once each time its target is (re)created, before OpenTofu creates its own. Deleting a missing setting succeeds.
+// https://opentofu.org/docs/language/resources/tf-data/
+resource "terraform_data" "diagnostic_setting_cleanup" {
+  for_each = local.monitoring_stale_setting_targets
+
+  triggers_replace = local.monitoring_targets[each.key].resource_id
+
+  provisioner "local-exec" {
+    command     = "& $env:LAB_DIAG_CLEANUP_SCRIPT"
+    interpreter = local.monitoring_cleanup_interpreter
+    environment = {
+      LAB_DIAG_CLEANUP_SCRIPT = abspath("${path.module}/scripts/Remove-DiagnosticSetting.ps1")
+      LAB_DIAG_CLEANUP_SETTINGS = jsonencode({
+        resource_id = local.monitoring_targets[each.key].resource_id
+        name        = local.monitoring_diagnostic_setting_name
+      })
+    }
+  }
+}
+
 // https://search.opentofu.org/provider/hashicorp/azurerm/latest/docs/resources/monitor_diagnostic_setting
 resource "azurerm_monitor_diagnostic_setting" "shared" {
   for_each = local.monitoring_targets
@@ -66,6 +88,8 @@ resource "azurerm_monitor_diagnostic_setting" "shared" {
   target_resource_id             = each.value.resource_id
   log_analytics_workspace_id     = azurerm_log_analytics_workspace.lab.id
   log_analytics_destination_type = each.value.destination_type
+
+  depends_on = [terraform_data.diagnostic_setting_cleanup]
 
   dynamic "enabled_log" {
     for_each = toset(data.azurerm_monitor_diagnostic_categories.shared[each.key].log_category_types)

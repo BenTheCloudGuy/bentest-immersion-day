@@ -59,6 +59,8 @@ locals {
   monitoring_workspace_resource_only_permissions = false
   monitoring_diagnostic_setting_name             = "lab-to-log-analytics"
   monitoring_avd_destination_type                = null
+  monitoring_stale_setting_targets               = toset(["bastion", "avd_host_pool", "avd_application_group", "avd_workspace"])
+  monitoring_cleanup_interpreter                 = ["pwsh", "-NoLogo", "-NoProfile", "-NonInteractive", "-Command"]
   monitoring_targets = merge({
     bastion = {
       resource_id      = azurerm_bastion_host.lab.id
@@ -278,13 +280,13 @@ locals {
     }
   ])
 
-  lab_key_vault_name                       = "${lower(local.key_vault_name_prefix)}-${substr(sha256("${var.tenant_id}:${var.subscription_id}:${var.resource_group_name}:v2"), 0, 8)}"
+  lab_key_vault_name                       = "${lower(local.key_vault_name_prefix)}-${substr(sha256("${var.tenant_id}:${var.subscription_id}:${var.resource_group_name}:v3"), 0, 8)}"
   lab_key_vault_sku                        = "standard"
   lab_key_vault_rbac_enabled               = true
   lab_key_vault_public_network_access      = true
-  lab_key_vault_purge_protection           = true
-  lab_key_vault_purge_on_destroy           = false
-  lab_key_vault_purge_secrets_on_destroy   = false
+  lab_key_vault_purge_protection           = false
+  lab_key_vault_purge_on_destroy           = true
+  lab_key_vault_purge_secrets_on_destroy   = true
   lab_key_vault_soft_delete_retention_days = 7
   lab_key_vault_writer_role                = "Key Vault Secrets Officer"
   lab_key_vault_reader_role                = "Key Vault Secrets User"

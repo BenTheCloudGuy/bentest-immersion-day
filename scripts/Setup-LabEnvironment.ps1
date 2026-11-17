@@ -920,7 +920,7 @@ function Invoke-LabDestroy {
 
     Write-Log 'Previewing the destroy plan (labdestroy.plan).'
     Invoke-OpenTofu @('plan', '-destroy', '-input=false', '-var', 'avd_session_host_count=0', '-out=labdestroy.plan')
-    Write-Log "This permanently removes the shared lab environment, the Entra lab users and group and the student resource groups. Key Vault has purge protection, so its soft-deleted vault is retained for 7 days. Staff credential files already on this machine are not deleted."
+    Write-Log "This permanently removes the shared lab environment, the Entra lab users and group and the student resource groups. Key Vault purge protection is off and the destroy purges the vault, so its name is reusable at once. Staff credential files already on this machine are not deleted."
     $typed = Read-HostLogged "Type the shared resource group name '$resourceGroup' to confirm the destroy (anything else cancels)"
     if ($typed -cne $resourceGroup) { throw 'Destroy cancelled: the confirmation did not match.' }
 
