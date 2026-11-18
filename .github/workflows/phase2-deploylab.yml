@@ -1,0 +1,326 @@
+name: Deploy lab (AVD hosts, lab users and TAPs)
+
+# Manual only: run it from the Actions tab after Deploy Packer prerequisites and Build lab image have succeeded.
+# Runs the Phase 2 OpenTofu apply as the pre-staged service principal: AVD session hosts from a gallery image version, the Entra lab users and group, the Temporary Access Pass (TAP) policy, and one TAP per user stored in the lab Key Vault.
+# The service principal needs seven Microsoft Graph roles and cannot grant them to itself. A Global Administrator runs .github/scripts/Grant-LabGraphPermissions.ps1 once; the first step here checks them.
+# The credentials file the apply writes stays on the runner and is deleted: this repository is public, so it is never uploaded as an artifact.
+on:
+  workflow_dispatch:
+    inputs:
+      deployment_name:
+        description: State deployment name; must match Deploy Packer prerequisites (empty uses resource_group_name from infra/terraform.tfvars)
+        required: false
+        default: ''
+        type: string
+      image_version:
+        description: Gallery image version for the session hosts; empty uses the newest published version
+        required: false
+        default: ''
+        type: string
+      lab_user_count:
+        description: Number of lab users (1-999); empty uses num_of_labusers from infra/terraform.tfvars
+        required: false
+        default: ''
+        type: string
+      session_host_count:
+        description: Number of session hosts (1-999); empty uses one host per four lab users
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-lab
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      ARM_CLIENT_ID: ${{ secrets.ARM_CLIENT_ID }}
+      ARM_CLIENT_SECRET: ${{ secrets.ARM_CLIENT_SECRET }}
+      ARM_TENANT_ID: ${{ secrets.ARM_TENANT_ID }}
+      ARM_SUBSCRIPTION_ID: ${{ secrets.ARM_SUBSCRIPTION_ID }}
+      TF_IN_AUTOMATION: 'true'
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Check required secrets
+        shell: pwsh
+        run: |
+          foreach ($name in 'ARM_CLIENT_ID', 'ARM_CLIENT_SECRET', 'ARM_TENANT_ID', 'ARM_SUBSCRIPTION_ID') {
+            if ([string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($name))) {
+              throw "Required Actions secret '$name' is not set."
+            }
+          }
+
+      - uses: opentofu/setup-opentofu@v1
+        with:
+          tofu_version: 1.13.1
+          tofu_wrapper: false
+
+      - name: Sign in with the pre-staged service principal
+        run: |
+          az login --service-principal \
+            --username "$ARM_CLIENT_ID" \
+            --password="$ARM_CLIENT_SECRET" \
+            --tenant "$ARM_TENANT_ID" --output none
+          az account set --subscription "$ARM_SUBSCRIPTION_ID"
+
+      - name: Check the service principal's Microsoft Graph roles
+        run: |
+          set -euo pipefail
+          token=$(az account get-access-token --resource https://graph.microsoft.com --query accessToken --output tsv)
+          payload=$(printf '%s' "$token" | cut -d. -f2 | tr '_-' '/+')
+          case $(( ${#payload} % 4 )) in 2) payload="$payload==" ;; 3) payload="$payload=" ;; esac
+          granted=$(printf '%s' "$payload" | base64 -d | jq -r '.roles // [] | .[]')
+          unset token payload
+          missing=()
+          for role in User.ReadWrite.All Group.ReadWrite.All Domain.Read.All Application.Read.All Policy.Read.All Policy.ReadWrite.AuthenticationMethod UserAuthenticationMethod.ReadWrite.All; do
+            if grep -qxF "$role" <<< "$granted"; then echo "$role: granted"; else echo "$role: MISSING"; missing+=("$role"); fi
+          done
+          if [ "${#missing[@]}" -gt 0 ]; then
+            echo "::error::The service principal's Graph token is missing: ${missing[*]}. A Global Administrator must run ./.github/scripts/Grant-LabGraphPermissions.ps1 once while signed in with az login as themselves. If that was just done, wait up to 10 minutes for the roles to reach new tokens and re-run."
+            exit 1
+          fi
+
+      - name: Resolve deployment settings
+        id: settings
+        shell: bash
+        env:
+          INPUT_IMAGE_VERSION: ${{ inputs.image_version }}
+          INPUT_USERS: ${{ inputs.lab_user_count }}
+          INPUT_HOSTS: ${{ inputs.session_host_count }}
+          GALLERY_RESOURCE_GROUP: ${{ vars.GALLERY_RESOURCE_GROUP }}
+          GALLERY_NAME: ${{ vars.GALLERY_NAME }}
+          IMAGE_DEFINITION_NAME: ${{ vars.IMAGE_DEFINITION_NAME }}
+        run: |
+          set -euo pipefail
+          if [ -z "$GALLERY_RESOURCE_GROUP" ] || [ -z "$GALLERY_NAME" ] || [ -z "$IMAGE_DEFINITION_NAME" ]; then
+            echo '::error::The GALLERY_* repository variables are not set. Run Deploy Packer prerequisites first.'
+            exit 1
+          fi
+
+          users="${INPUT_USERS:-$(sed -nE 's/^num_of_labusers[[:space:]]*=[[:space:]]*([0-9]+).*/\1/p' infra/terraform.tfvars | head -n1)}"
+          if [[ ! "$users" =~ ^[0-9]+$ ]] || [ "$users" -lt 1 ] || [ "$users" -gt 999 ]; then
+            echo "::error::The lab user count must be a whole number from 1 to 999 (got '$users')."
+            exit 1
+          fi
+          hosts="${INPUT_HOSTS:-$(( (users + 3) / 4 ))}"
+          if [[ ! "$hosts" =~ ^[0-9]+$ ]] || [ "$hosts" -lt 1 ] || [ "$hosts" -gt 999 ]; then
+            echo "::error::The session host count must be a whole number from 1 to 999 (got '$hosts')."
+            exit 1
+          fi
+
+          versions=$(az sig image-version list \
+            --resource-group "$GALLERY_RESOURCE_GROUP" \
+            --gallery-name "$GALLERY_NAME" \
+            --gallery-image-definition "$IMAGE_DEFINITION_NAME" \
+            --query "[?provisioningState=='Succeeded'].name" --output tsv)
+          if [ -z "$versions" ]; then
+            echo '::error::The gallery has no published image version. Run Build lab image first.'
+            exit 1
+          fi
+          version="${INPUT_IMAGE_VERSION:-$(printf '%s\n' "$versions" | sort -V | tail -n1)}"
+          if ! printf '%s\n' "$versions" | grep -qxF "$version"; then
+            echo "::error::Image version '$version' is not a published version. Available: $(printf '%s ' $versions)"
+            exit 1
+          fi
+
+          echo "users=$users" >> "$GITHUB_OUTPUT"
+          echo "hosts=$hosts" >> "$GITHUB_OUTPUT"
+          echo "image_version=$version" >> "$GITHUB_OUTPUT"
+          echo "::notice::Deploying $users lab users and $hosts session hosts from image version $version."
+
+      - name: Resolve the state backend names
+        env:
+          INPUT_DEPLOYMENT_NAME: ${{ inputs.deployment_name }}
+        run: |
+          set -euo pipefail
+          lab_resource_group=$(sed -nE 's/^resource_group_name[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' infra/terraform.tfvars | head -n1)
+          if [ -z "$lab_resource_group" ]; then
+            echo '::error::resource_group_name must be a quoted string in infra/terraform.tfvars.'
+            exit 1
+          fi
+          deployment_name="${INPUT_DEPLOYMENT_NAME:-$lab_resource_group}"
+          if [[ ! "$deployment_name" =~ ^[A-Za-z0-9][A-Za-z0-9_-]{0,79}$ ]]; then
+            echo '::error::deployment_name must contain 1-80 letters, digits, underscores or hyphens, starting with a letter or digit.'
+            exit 1
+          fi
+          hash=$(printf '%s' "$ARM_SUBSCRIPTION_ID/$deployment_name" | tr '[:upper:]' '[:lower:]' | sha256sum | cut -c1-19)
+          {
+            echo "STATE_RESOURCE_GROUP=$deployment_name-state"
+            echo "STATE_STORAGE_ACCOUNT=stlab$hash"
+            echo "STATE_CONTAINER=infra"
+            echo "STATE_KEY=prereq/$deployment_name.tfstate"
+          } >> "$GITHUB_ENV"
+          echo "State: $deployment_name-state / stlab$hash / infra / prereq/$deployment_name.tfstate"
+
+      - name: Check the service principal can read the state
+        run: |
+          if ! az storage blob list --account-name "$STATE_STORAGE_ACCOUNT" --container-name "$STATE_CONTAINER" --num-results 1 --auth-mode login --output none; then
+            echo "::error::The service principal cannot read $STATE_STORAGE_ACCOUNT. Run Deploy Packer prerequisites first (with the same deployment_name); it creates the state storage and grants the Storage Blob Data Contributor role."
+            exit 1
+          fi
+
+      - name: Initialize OpenTofu
+        run: |
+          tofu -chdir=infra init -input=false -no-color \
+            -backend-config="resource_group_name=$STATE_RESOURCE_GROUP" \
+            -backend-config="storage_account_name=$STATE_STORAGE_ACCOUNT" \
+            -backend-config="container_name=$STATE_CONTAINER" \
+            -backend-config="key=$STATE_KEY"
+
+      - name: Check the foundation is deployed
+        shell: bash
+        run: |
+          set -euo pipefail
+          state=$(tofu -chdir=infra show -json | jq -r '.values.root_module? | select(. != null) | recurse(.child_modules[]?) | .resources[]? | select(.mode == "managed") | .address')
+          for required in azurerm_resource_group.shared azurerm_linux_virtual_machine.runner azurerm_key_vault.lab_credentials azurerm_virtual_desktop_host_pool.lab; do
+            if ! grep -qxF "$required" <<< "$state"; then
+              echo "::error::$required is not in the state. Run Deploy Packer prerequisites first (with the same deployment_name); this workflow only adds hosts, users and TAPs."
+              exit 1
+            fi
+          done
+
+      - name: Prepare the session host administrator password and Phase 2 values
+        shell: bash
+        env:
+          AVD_ADMIN_PASSWORD: ${{ secrets.AVD_ADMIN_PASSWORD }}
+          USERS: ${{ steps.settings.outputs.users }}
+          HOSTS: ${{ steps.settings.outputs.hosts }}
+          IMAGE_VERSION: ${{ steps.settings.outputs.image_version }}
+        run: |
+          set -euo pipefail
+          vault=$(tofu -chdir=infra output -json lab_credentials_key_vault | jq -r .name)
+          secret_name=avd-local-admin-password
+
+          # Changing the password replaces every session host, so a re-run must reuse the same one.
+          if [ -n "${AVD_ADMIN_PASSWORD:-}" ]; then
+            echo "::add-mask::$AVD_ADMIN_PASSWORD"
+            password="$AVD_ADMIN_PASSWORD"
+            echo 'Administrator password: from the AVD_ADMIN_PASSWORD Actions secret.'
+          elif [ -n "$(az keyvault secret list --vault-name "$vault" --query "[?name=='$secret_name'].name" --output tsv)" ]; then
+            password=$(az keyvault secret show --vault-name "$vault" --name "$secret_name" --query value --output tsv)
+            echo "::add-mask::$password"
+            echo "Administrator password: reused from Key Vault secret $secret_name."
+          else
+            password="Aa1!$(openssl rand -hex 14)"
+            echo "::add-mask::$password"
+            umask 077
+            printf '%s' "$password" > "$RUNNER_TEMP/avd-admin-password"
+            az keyvault secret set --vault-name "$vault" --name "$secret_name" --file "$RUNNER_TEMP/avd-admin-password" --encoding utf-8 --output none
+            rm -f "$RUNNER_TEMP/avd-admin-password"
+            echo "Administrator password: generated and stored in Key Vault secret $secret_name."
+          fi
+
+          umask 077
+          jq -n \
+            --arg password "$password" \
+            --arg version "$IMAGE_VERSION" \
+            --arg expiry "$(date -u -d '+7 days' '+%Y-%m-%dT%H:%M:%SZ')" \
+            --argjson users "$USERS" \
+            --argjson hosts "$HOSTS" \
+            '{num_of_labusers: $users, avd_session_host_count: $hosts, avd_image_version: $version, avd_admin_password: $password, avd_registration_expiration: $expiry}' \
+            > infra/zz-lab-phase2.auto.tfvars.json
+
+      - name: Plan hosts, lab users and TAPs
+        shell: bash
+        run: |
+          set -euo pipefail
+          tofu -chdir=infra validate -no-color
+          tofu -chdir=infra plan -input=false -no-color \
+            -var="subscription_id=$ARM_SUBSCRIPTION_ID" \
+            -var="tenant_id=$ARM_TENANT_ID" \
+            -var="runner_github_repository=$GITHUB_REPOSITORY" \
+            -out=labphase2.plan
+
+          echo '--- planned actions'
+          tofu -chdir=infra show -json labphase2.plan | jq -r '.resource_changes[] | .change.actions | join("/")' | sort | uniq -c
+
+          # Phase 2 only adds hosts, users and TAPs. Never let it remove or replace the foundation or the registered runner.
+          protected='^(azurerm_resource_group\.shared|azurerm_linux_virtual_machine\.runner|azurerm_key_vault\.|azurerm_log_analytics_workspace\.|azurerm_virtual_network\.|azurerm_storage_account\.|azurerm_bastion_host\.|azurerm_shared_image|random_password\.runner$)'
+          doomed=$(tofu -chdir=infra show -json labphase2.plan | jq -r '.resource_changes[] | select(.change.actions | index("delete")) | .address' | grep -E "$protected" || true)
+          if [ -n "$doomed" ]; then
+            echo '::error::The plan would delete or replace foundation resources; nothing was applied:'
+            echo "$doomed"
+            exit 1
+          fi
+
+      - name: Apply hosts, lab users and TAPs
+        shell: bash
+        run: |
+          set -euo pipefail
+          tofu -chdir=infra apply -input=false -no-color \
+            -var="subscription_id=$ARM_SUBSCRIPTION_ID" \
+            -var="tenant_id=$ARM_TENANT_ID" \
+            -var="runner_github_repository=$GITHUB_REPOSITORY" \
+            labphase2.plan
+
+      - name: Verify the hosts, the TAPs and the stored credentials
+        shell: bash
+        env:
+          USERS: ${{ steps.settings.outputs.users }}
+          HOSTS: ${{ steps.settings.outputs.hosts }}
+          IMAGE_VERSION: ${{ steps.settings.outputs.image_version }}
+        run: |
+          set -euo pipefail
+          pool=$(tofu -chdir=infra output -json avd_configuration | jq -r .host_pool_id)
+          deadline=$((SECONDS + 2400))
+          while true; do
+            hosts_json=$(az rest --method GET --url "https://management.azure.com${pool}/sessionHosts?api-version=2024-04-03" --output json)
+            available=$(jq '[.value[] | select(.properties.status == "Available")] | length' <<< "$hosts_json")
+            echo "Session hosts Available: $available of $HOSTS"
+            jq -r '.value[] | "  \(.name | split("/") | last)  \(.properties.status)"' <<< "$hosts_json"
+            if [ "$available" -ge "$HOSTS" ]; then break; fi
+            if [ "$SECONDS" -ge "$deadline" ]; then
+              echo "::error::Only $available of $HOSTS session hosts became Available within 40 minutes. The apply succeeded; check the agent status in the host pool."
+              exit 1
+            fi
+            sleep 30
+          done
+
+          {
+            echo '## Lab deployed'
+            echo
+            echo "Image version \`$IMAGE_VERSION\`; session hosts Available: $available of $HOSTS."
+            echo
+            echo '| Lab user | TAP usable | TAP lifetime (minutes) | TAP starts (UTC) |'
+            echo '| --- | --- | --- | --- |'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          checked=0
+          unusable=0
+          while read -r upn oid; do
+            tap=$(az rest --method GET --url "https://graph.microsoft.com/v1.0/users/${oid}/authentication/temporaryAccessPassMethods" --output json \
+              | jq -r '[.value[] | select(.isUsable == true)] | if length > 0 then "yes|\(.[0].lifetimeInMinutes)|\(.[0].startDateTime)" else "NO|-|-" end')
+            IFS='|' read -r usable lifetime start <<< "$tap"
+            echo "$upn  TAP usable: $usable  lifetime: $lifetime minutes  starts: $start"
+            echo "| $upn | $usable | $lifetime | $start |" >> "$GITHUB_STEP_SUMMARY"
+            checked=$((checked + 1))
+            if [ "$usable" != yes ]; then unusable=$((unusable + 1)); fi
+          done < <(tofu -chdir=infra output -json lab_users | jq -r 'to_entries[] | "\(.value.user_principal_name) \(.value.object_id)"')
+
+          vault=$(tofu -chdir=infra output -json lab_credentials_key_vault | jq -r .name)
+          stored=$(az keyvault secret list --vault-name "$vault" --query "length([?ends_with(name, '-credentials')])" --output tsv)
+          {
+            echo
+            echo "Credentials (initial password and TAP per user) are in Key Vault \`$vault\` as secrets named \`<labuser>-credentials\`: $stored of $USERS stored."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$checked" -ne "$USERS" ] || [ "$unusable" -gt 0 ] || [ "$stored" -lt "$USERS" ]; then
+            echo "::error::Verification failed: $checked of $USERS users checked, $unusable without a usable TAP, $stored of $USERS credential secrets stored."
+            exit 1
+          fi
+          echo "All $USERS lab users have a usable TAP and a stored credential record."
+
+      - name: Remove secrets from the runner
+        if: always()
+        shell: bash
+        run: |
+          rm -f infra/zz-lab-phase2.auto.tfvars.json infra/labphase2.plan
+          rm -rf artifacts/credentials
+          az logout 2>/dev/null || true

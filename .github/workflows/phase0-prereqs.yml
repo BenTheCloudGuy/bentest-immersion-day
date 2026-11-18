@@ -1,0 +1,297 @@
+name: Deploy Packer prerequisites
+
+# State is retained in Azure Storage outside the lab resource group.
+on:
+  workflow_dispatch:
+    inputs:
+      deployment_name:
+        description: State deployment name; empty uses resource_group_name from infra/terraform.tfvars
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-packer-prereqs
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      ARM_CLIENT_ID: ${{ secrets.ARM_CLIENT_ID }}
+      ARM_CLIENT_SECRET: ${{ secrets.ARM_CLIENT_SECRET }}
+      ARM_TENANT_ID: ${{ secrets.ARM_TENANT_ID }}
+      ARM_SUBSCRIPTION_ID: ${{ secrets.ARM_SUBSCRIPTION_ID }}
+      GH_TOKEN: ${{ secrets.GH_TOKEN }}
+      TF_IN_AUTOMATION: 'true'
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Check required secrets
+        shell: pwsh
+        run: |
+          foreach ($name in 'ARM_CLIENT_ID', 'ARM_CLIENT_SECRET', 'ARM_TENANT_ID', 'ARM_SUBSCRIPTION_ID', 'GH_TOKEN') {
+            if ([string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($name))) {
+              throw "Required Actions secret '$name' is not set."
+            }
+          }
+
+      - uses: opentofu/setup-opentofu@v1
+        with:
+          tofu_version: 1.13.1
+          tofu_wrapper: false
+
+      - uses: hashicorp/setup-packer@v3
+        with:
+          version: 1.16.1
+
+      - name: Sign in with the pre-staged service principal
+        run: |
+          az login --service-principal \
+            --username "$ARM_CLIENT_ID" \
+            --password="$ARM_CLIENT_SECRET" \
+            --tenant "$ARM_TENANT_ID" --output none
+          az account set --subscription "$ARM_SUBSCRIPTION_ID"
+
+      - name: Check GitHub access
+        run: |
+          gh api "repos/$GITHUB_REPOSITORY/actions/runners" --silent
+          gh variable list --repo "$GITHUB_REPOSITORY" --json name > /dev/null
+
+      - name: Register Azure resource providers
+        run: |
+          for namespace in \
+            Microsoft.Compute Microsoft.Network Microsoft.KeyVault \
+            Microsoft.DesktopVirtualization Microsoft.Storage \
+            Microsoft.OperationalInsights Microsoft.Insights; do
+            az provider register --namespace "$namespace" --wait
+          done
+
+      - name: Resolve the state backend names
+        env:
+          INPUT_DEPLOYMENT_NAME: ${{ inputs.deployment_name }}
+        run: |
+          set -euo pipefail
+          tfvar() { sed -nE 's/^'"$1"'[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' infra/terraform.tfvars | head -n1; }
+          lab_resource_group=$(tfvar resource_group_name)
+          location=$(tfvar location)
+          if [ -z "$lab_resource_group" ] || [ -z "$location" ]; then
+            echo '::error::resource_group_name and location must be quoted strings in infra/terraform.tfvars.'
+            exit 1
+          fi
+          deployment_name="${INPUT_DEPLOYMENT_NAME:-$lab_resource_group}"
+          if [[ ! "$deployment_name" =~ ^[A-Za-z0-9][A-Za-z0-9_-]{0,79}$ ]]; then
+            echo '::error::deployment_name must contain 1-80 letters, digits, underscores or hyphens, starting with a letter or digit.'
+            exit 1
+          fi
+          # The account name is deterministic and globally unique: stlab + the first 19 hex characters of SHA-256 of the lowercased "<subscriptionId>/<deploymentName>".
+          hash=$(printf '%s' "$ARM_SUBSCRIPTION_ID/$deployment_name" | tr '[:upper:]' '[:lower:]' | sha256sum | cut -c1-19)
+          {
+            echo "DEPLOYMENT_NAME=$deployment_name"
+            echo "LAB_RESOURCE_GROUP=$lab_resource_group"
+            echo "LOCATION=$location"
+            echo "STATE_RESOURCE_GROUP=$deployment_name-state"
+            echo "STATE_STORAGE_ACCOUNT=stlab$hash"
+            echo "STATE_CONTAINER=infra"
+            echo "STATE_KEY=prereq/$deployment_name.tfstate"
+          } >> "$GITHUB_ENV"
+          echo "State: $deployment_name-state / stlab$hash / infra / prereq/$deployment_name.tfstate"
+
+      - name: Create the state resource group
+        run: az group create --name "$STATE_RESOURCE_GROUP" --location "$LOCATION" --output none
+
+      - name: Create the state storage account (Microsoft Entra ID only, no keys)
+        run: |
+          if az storage account show --resource-group "$STATE_RESOURCE_GROUP" --name "$STATE_STORAGE_ACCOUNT" --output none 2>/dev/null; then
+            echo "Storage account $STATE_STORAGE_ACCOUNT already exists."
+          else
+            az storage account create \
+              --resource-group "$STATE_RESOURCE_GROUP" --name "$STATE_STORAGE_ACCOUNT" \
+              --location "$LOCATION" --sku Standard_LRS --kind StorageV2 \
+              --allow-shared-key-access false --output none
+            echo "Created storage account $STATE_STORAGE_ACCOUNT with shared key access disabled."
+          fi
+
+      - name: Create the state container
+        run: |
+          az storage container-rm create \
+            --resource-group "$STATE_RESOURCE_GROUP" --storage-account "$STATE_STORAGE_ACCOUNT" \
+            --name "$STATE_CONTAINER" --output none
+
+      - name: Grant the service principal Storage Blob Data Contributor on the state account
+        run: |
+          set -euo pipefail
+          # The role goes to the service principal's own object ID, read from its token, so no Microsoft Graph permission is needed.
+          token=$(az account get-access-token --resource https://management.azure.com --query accessToken --output tsv)
+          payload=$(printf '%s' "$token" | cut -d. -f2 | tr '_-' '/+')
+          case $(( ${#payload} % 4 )) in 2) payload="$payload==" ;; 3) payload="$payload=" ;; esac
+          principal_id=$(printf '%s' "$payload" | base64 -d | jq -r '.oid')
+          unset token payload
+          scope=$(az storage account show --resource-group "$STATE_RESOURCE_GROUP" --name "$STATE_STORAGE_ACCOUNT" --query id --output tsv)
+          if output=$(az role assignment create --assignee-object-id "$principal_id" --assignee-principal-type ServicePrincipal \
+              --role 'Storage Blob Data Contributor' --scope "$scope" --only-show-errors --output none 2>&1); then
+            echo "Granted Storage Blob Data Contributor to $principal_id on $STATE_STORAGE_ACCOUNT."
+          elif grep -qiE 'RoleAssignmentExists|already exists' <<< "$output"; then
+            echo "Storage Blob Data Contributor is already assigned to $principal_id on $STATE_STORAGE_ACCOUNT."
+          else
+            echo '::error::Could not assign the role. The service principal needs Owner or User Access Administrator on the subscription.'
+            echo "$output"
+            exit 1
+          fi
+
+      - name: Wait for the state storage role to take effect
+        run: |
+          deadline=$((SECONDS + 600))
+          until az storage blob list --account-name "$STATE_STORAGE_ACCOUNT" --container-name "$STATE_CONTAINER" --num-results 1 --auth-mode login --output none 2>/dev/null; do
+            if [ "$SECONDS" -ge "$deadline" ]; then
+              echo "::error::The Storage Blob Data Contributor role on $STATE_STORAGE_ACCOUNT did not take effect within 10 minutes. Re-run the workflow."
+              exit 1
+            fi
+            echo 'Waiting for the role to take effect...'
+            sleep 15
+          done
+          echo 'The service principal can read and write the state container.'
+
+      - name: Initialize OpenTofu
+        run: |
+          tofu -chdir=infra init -input=false -no-color \
+            -backend-config="resource_group_name=$STATE_RESOURCE_GROUP" \
+            -backend-config="storage_account_name=$STATE_STORAGE_ACCOUNT" \
+            -backend-config="container_name=$STATE_CONTAINER" \
+            -backend-config="key=$STATE_KEY"
+
+      - name: Check foundation state and validate OpenTofu
+        run: |
+          tofu -chdir=infra validate -no-color
+          state_json=$(tofu -chdir=infra show -json)
+          state=$(jq -r '.values.root_module? | select(. != null) | recurse(.child_modules[]?) | .resources[]? | select(.mode == "managed") | .address' <<< "$state_json")
+          group_exists=$(az group exists --name "$LAB_RESOURCE_GROUP")
+          if [ -z "$state" ] && [ "$group_exists" = true ]; then
+            echo '::error::The lab resource group exists but this backend has no managed resources. Recover/import the existing deployment into this backend before rerunning; no foundation apply was attempted.'
+            exit 1
+          fi
+          if grep -qE '^azuread_user\.lab|^azurerm_windows_virtual_machine\.session_hosts' <<< "$state"; then
+            echo '::error::Lab users or session hosts already exist in state. Use Phase2 with their intended counts; this foundation workflow would remove them.'
+            exit 1
+          fi
+
+      - name: Plan foundation without lab users or session hosts
+        run: |
+          tofu -chdir=infra plan -input=false -no-color \
+            -var="subscription_id=$ARM_SUBSCRIPTION_ID" \
+            -var="tenant_id=$ARM_TENANT_ID" \
+            -var="runner_github_repository=$GITHUB_REPOSITORY" \
+            -var='num_of_labusers=0' \
+            -var='avd_session_host_count=0' \
+            -out=labphase1.plan
+
+      - name: Apply foundation
+        run: |
+          tofu -chdir=infra apply -input=false -no-color \
+            -var="subscription_id=$ARM_SUBSCRIPTION_ID" \
+            -var="tenant_id=$ARM_TENANT_ID" \
+            -var="runner_github_repository=$GITHUB_REPOSITORY" \
+            -var='num_of_labusers=0' \
+            -var='avd_session_host_count=0' \
+            labphase1.plan
+
+      - name: Wait for the runner VM to finish installing its tools
+        run: |
+          set -euo pipefail
+          runner=$(tofu -chdir=infra output -json runner_configuration)
+          name=$(jq -r .name <<< "$runner")
+          group=$(jq -r .resource_group_name <<< "$runner")
+          deadline=$((SECONDS + 1500))
+          while true; do
+            state=$(az vm run-command invoke --resource-group "$group" --name "$name" --command-id RunShellScript \
+              --scripts 'if [ -f /opt/runner-bootstrap.failed ]; then echo FAILED; tail -n 40 /var/log/runner-bootstrap.log; elif [ -f /opt/runner-bootstrap.done ]; then echo DONE; else echo PENDING; fi' \
+              --query 'value[0].message' --output tsv)
+            case "$state" in
+              *FAILED*) echo '::error::The runner bootstrap failed:'; echo "$state"; exit 1 ;;
+              *DONE*) break ;;
+            esac
+            if [ "$SECONDS" -ge "$deadline" ]; then
+              echo '::error::The runner did not finish its bootstrap within 25 minutes.'
+              exit 1
+            fi
+            echo 'Runner bootstrap still running...'
+            sleep 30
+          done
+          az vm run-command invoke --resource-group "$group" --name "$name" --command-id RunShellScript \
+            --scripts 'cat /opt/runner-tools.txt' --query 'value[0].message' --output tsv
+
+      - name: Register the runner with this repository
+        run: |
+          set -euo pipefail
+          runner=$(tofu -chdir=infra output -json runner_configuration)
+          name=$(jq -r .name <<< "$runner")
+          group=$(jq -r .resource_group_name <<< "$runner")
+          admin=$(jq -r .admin_username <<< "$runner")
+          labels=$(jq -r '.labels | map(select(. != "self-hosted" and . != "linux")) | join(",")' <<< "$runner")
+          status=$(gh api "repos/$GITHUB_REPOSITORY/actions/runners" --jq ".runners[] | select(.name == \"$name\") | .status")
+          if [ "$status" = online ]; then
+            echo "Runner $name is already registered and online."
+            exit 0
+          fi
+          token=$(gh api -X POST "repos/$GITHUB_REPOSITORY/actions/runners/registration-token" --jq .token)
+          echo "::add-mask::$token"
+          script="$RUNNER_TEMP/register-runner.sh"
+          cat > "$script" <<EOF
+          set -e
+          cd /opt/actions-runner
+          if [ -f .runner ]; then ./svc.sh stop || true; ./svc.sh uninstall || true; sudo -u $admin ./config.sh remove --token '$token' || true; fi
+          sudo -u $admin ./config.sh --unattended --replace --url 'https://github.com/$GITHUB_REPOSITORY' --token '$token' --name '$name' --labels '$labels' --work /opt/actions-runner/_work
+          ./svc.sh install $admin
+          ./svc.sh start
+          EOF
+          az vm run-command invoke --resource-group "$group" --name "$name" --command-id RunShellScript \
+            --scripts "@$script" --query 'value[0].message' --output tsv
+          rm -f "$script"
+
+      - name: Wait for the runner to come online
+        run: |
+          set -euo pipefail
+          name=$(tofu -chdir=infra output -json runner_configuration | jq -r .name)
+          deadline=$((SECONDS + 180))
+          until [ "$(gh api "repos/$GITHUB_REPOSITORY/actions/runners" --jq ".runners[] | select(.name == \"$name\") | .status")" = online ]; do
+            if [ "$SECONDS" -ge "$deadline" ]; then
+              echo '::error::The runner registered but is not online in GitHub after 3 minutes.'
+              exit 1
+            fi
+            sleep 10
+          done
+          gh api "repos/$GITHUB_REPOSITORY/actions/runners" --jq ".runners[] | select(.name == \"$name\") | {name, status, labels: [.labels[].name]}"
+
+      - name: Publish the image-build repository variables
+        run: |
+          set -euo pipefail
+          cfg=$(tofu -chdir=infra output -json packer_configuration)
+          set_var() { gh variable set "$1" --repo "$GITHUB_REPOSITORY" --body "$2"; echo "$1 = $2"; }
+          set_var AZURE_SUBSCRIPTION_ID  "$(jq -r .subscription_id <<< "$cfg")"
+          set_var AZURE_TENANT_ID        "$(jq -r .tenant_id <<< "$cfg")"
+          set_var AZURE_LOCATION         "$(jq -r .location <<< "$cfg")"
+          set_var GALLERY_RESOURCE_GROUP "$(jq -r .gallery_resource_group <<< "$cfg")"
+          set_var GALLERY_NAME           "$(jq -r .gallery_name <<< "$cfg")"
+          set_var IMAGE_DEFINITION_NAME  "$(jq -r .image_definition_name <<< "$cfg")"
+          set_var REPLICATION_REGIONS    "$(jq -c .replication_regions <<< "$cfg")"
+          set_var VNET_NAME              "$(jq -r .virtual_network_name <<< "$cfg")"
+          set_var VNET_RESOURCE_GROUP    "$(jq -r .virtual_network_resource_group_name <<< "$cfg")"
+          set_var VNET_SUBNET_NAME       "$(jq -r .virtual_network_subnet_name <<< "$cfg")"
+          set_var RESOURCE_TAGS          "$(jq -c .tags <<< "$cfg")"
+
+      - name: Summarize deployment
+        run: |
+          {
+            echo '## Packer prerequisites deployed'
+            echo
+            echo 'The private self-hosted runner is online and the image-build repository variables are configured.'
+            echo 'Run **Build lab image** to build using the pre-staged service principal.'
+            echo
+            echo '**Persistent state:** Azure Storage retains state, including partial applies.'
+            echo 'Container: `infra`; blob: `prereq/${{ env.DEPLOYMENT_NAME }}.tfstate`.'
+            echo 'Keep the state resource group when cleaning up lab resources.'
+          } >> "$GITHUB_STEP_SUMMARY"

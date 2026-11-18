@@ -16,7 +16,7 @@
     It refuses to run when student resource groups or LabUser accounts exist; use the setup script's -Destroy for a populated lab.
 
 .PARAMETER DeploymentName
-    State deployment name; empty uses resource_group_name from infra/terraform.tfvars (same default as Initialize-PrerequisiteState.ps1).
+    State deployment name; empty uses resource_group_name from infra/terraform.tfvars (same default as the state steps in phase0-prereqs.yml).
 
 .PARAMETER Repository
     GitHub owner/repo whose runner and variables should be cleared, for example BenTheCloudGuy/bentest-immersion-day.
