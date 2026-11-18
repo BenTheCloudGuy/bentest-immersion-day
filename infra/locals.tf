@@ -59,8 +59,6 @@ locals {
   monitoring_workspace_resource_only_permissions = false
   monitoring_diagnostic_setting_name             = "lab-to-log-analytics"
   monitoring_avd_destination_type                = null
-  monitoring_stale_setting_targets               = toset(["bastion", "avd_host_pool", "avd_application_group", "avd_workspace"])
-  monitoring_cleanup_interpreter                 = ["pwsh", "-NoLogo", "-NoProfile", "-NonInteractive", "-Command"]
   monitoring_targets = merge({
     bastion = {
       resource_id      = azurerm_bastion_host.lab.id
